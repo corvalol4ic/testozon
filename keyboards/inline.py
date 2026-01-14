@@ -1,60 +1,42 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-
-def get_start_keyboard() -> InlineKeyboardMarkup:
+def get_activation_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для активации"""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
-        text="🔑 Получить ключ",
-        callback_data="get_access_key"
+        text="🔑 Активировать ключ",
+        callback_data="activate_key"
     ))
     builder.add(InlineKeyboardButton(
-        text="📊 Моя подписка",
+        text="💎 Купить подписку",
+        url="https://your-site.com/buy"  # Замените на свою ссылку
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📋 Моя подписка",
         callback_data="my_subscription"
-    ))
-    builder.add(InlineKeyboardButton(
-        text="💎 Планы",
-        callback_data="view_plans"
-    ))
-    builder.add(InlineKeyboardButton(
-        text="🔄 Обновить ключ",
-        callback_data="regenerate_key"
     ))
     builder.adjust(2)
     return builder.as_markup()
 
-
-def get_subscription_keyboard() -> InlineKeyboardMarkup:
+def get_admin_keys_keyboard() -> InlineKeyboardMarkup:
+    """Админ клавиатура для управления ключами"""
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(
-        text="💎 Улучшить подписку",
-        callback_data="upgrade_subscription"
+        text="🔄 Сгенерировать ключи",
+        callback_data="admin_generate_keys"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📋 Список ключей",
+        callback_data="admin_list_keys"
     ))
     builder.add(InlineKeyboardButton(
         text="📊 Статистика",
-        callback_data="view_stats"
+        callback_data="admin_keys_stats"
     ))
     builder.add(InlineKeyboardButton(
-        text="🔑 Ключ доступа",
-        callback_data="get_access_key"
+        text="❌ Отозвать ключ",
+        callback_data="admin_revoke_key"
     ))
     builder.adjust(2)
-    return builder.as_markup()
-
-
-def get_upgrade_keyboard(plans: list) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-
-    for plan in plans:
-        builder.add(InlineKeyboardButton(
-            text=f"💎 {plan}",
-            callback_data=f"upgrade_to_{plan.lower()}"
-        ))
-
-    builder.add(InlineKeyboardButton(
-        text="❌ Отмена",
-        callback_data="cancel_upgrade"
-    ))
-
-    builder.adjust(1)
     return builder.as_markup()
