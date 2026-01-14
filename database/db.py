@@ -6,7 +6,7 @@ import hashlib
 from threading import Lock
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from config import Config
 
 
@@ -41,7 +41,6 @@ class Database:
     async def create_tables(self):
         """Создание таблиц в базе данных"""
 
-
         def sync_create():
             with self._lock:
                 conn = self._get_connection()
@@ -74,8 +73,7 @@ class Database:
                         used_at TIMESTAMP,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         expires_at TIMESTAMP,
-                        FOREIGN KEY (plan_id) REFERENCES subscription_plans (id),
-                        FOREIGN KEY (used_by_user_id) REFERENCES users (user_id) ON DELETE SET NULL
+                        FOREIGN KEY (plan_id) REFERENCES subscription_plans (id)
                     )
                 ''')
 
@@ -131,6 +129,22 @@ class Database:
                     )
                 ''')
 
+                # Таблица ссылок пользователя
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_links (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        url TEXT NOT NULL,
+                        title TEXT,
+                        description TEXT,
+                        category TEXT DEFAULT 'general',
+                        is_active BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+                    )
+                ''')
+
                 # Создание индексов
                 indexes = [
                     'CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)',
@@ -140,19 +154,12 @@ class Database:
                     'CREATE INDEX IF NOT EXISTS idx_activation_keys_is_used ON activation_keys(is_used)',
                     'CREATE INDEX IF NOT EXISTS idx_users_subscription_end ON users(subscription_end)',
                     'CREATE INDEX IF NOT EXISTS idx_subscription_history_user_id ON subscription_history(user_id)',
-                    'CREATE INDEX IF NOT EXISTS idx_user_requests_user_id ON user_requests(user_id)'
+                    'CREATE INDEX IF NOT EXISTS idx_user_requests_user_id ON user_requests(user_id)',
+                    'CREATE INDEX IF NOT EXISTS idx_user_links_user_id ON user_links(user_id)',
+                    'CREATE INDEX IF NOT EXISTS idx_user_links_category ON user_links(category)',
+                    'CREATE INDEX IF NOT EXISTS idx_user_links_is_active ON user_links(is_active)'
                 ]
-                cursor.execute("PRAGMA table_info(activation_keys)")
-                columns = [col[1] for col in cursor.fetchall()]
 
-                if 'expires_at' not in columns:
-                    cursor.execute('ALTER TABLE activation_keys ADD COLUMN expires_at TIMESTAMP')
-
-                cursor.execute("PRAGMA table_info(subscription_plans)")
-                columns = [col[1] for col in cursor.fetchall()]
-
-                if 'max_activation_keys' not in columns:
-                    cursor.execute('ALTER TABLE subscription_plans ADD COLUMN max_activation_keys INTEGER DEFAULT 1')
                 for index_sql in indexes:
                     cursor.execute(index_sql)
 
@@ -226,7 +233,7 @@ class Database:
         return await asyncio.to_thread(sync_generate)
 
     async def activate_key(self, user_id: int, key_code: str) -> Dict[str, Any]:
-        """Активация ключа пользователем"""
+        """Активация ключа пользователем с защитой от повторного использования"""
 
         def sync_activate():
             with self._lock:
@@ -238,7 +245,7 @@ class Database:
                     SELECT ak.*, sp.name as plan_name, sp.max_requests, sp.duration_days
                     FROM activation_keys ak
                     JOIN subscription_plans sp ON ak.plan_id = sp.id
-                    WHERE ak.key_code = ? AND ak.is_used = 0 
+                    WHERE ak.key_code = ? 
                     AND (ak.expires_at IS NULL OR ak.expires_at > CURRENT_TIMESTAMP)
                 ''', (key_code,))
 
@@ -248,10 +255,27 @@ class Database:
                     conn.close()
                     return {
                         'success': False,
-                        'error': 'Ключ не найден, уже использован или просрочен'
+                        'error': 'Ключ не найден или просрочен'
                     }
 
                 key_id = key_data['id']
+
+                # Проверяем, использован ли ключ
+                if key_data['is_used']:
+                    # Проверяем, привязан ли ключ к этому пользователю
+                    if key_data['used_by_user_id'] == user_id:
+                        conn.close()
+                        return {
+                            'success': False,
+                            'error': 'Этот ключ уже активирован на вашем аккаунте'
+                        }
+                    else:
+                        conn.close()
+                        return {
+                            'success': False,
+                            'error': 'Ключ уже использован другим пользователем'
+                        }
+
                 plan_id = key_data['plan_id']
                 plan_name = key_data['plan_name']
                 max_requests = key_data['max_requests']
@@ -264,44 +288,50 @@ class Database:
                 )
                 user = cursor.fetchone()
 
-                # Устанавливаем даты подписки
-                start_date = datetime.now().date()
-                end_date = start_date + timedelta(days=duration_days)
-
-                if user:
-                    # Обновляем существующего пользователя
-                    cursor.execute('''
-                        UPDATE users 
-                        SET subscription_plan_id = ?,
-                            activation_key_id = ?,
-                            requests_limit = ?,
-                            requests_used = 0,
-                            subscription_start = ?,
-                            subscription_end = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE user_id = ?
-                    ''', (plan_id, key_id, max_requests, start_date, end_date, user_id))
-                else:
-                    # Создаем нового пользователя (заглушка, реальное создание в add_user)
-                    # Здесь только обновляем ключ
-                    cursor.execute('''
-                        UPDATE activation_keys 
-                        SET is_used = 1, used_by_user_id = ?, used_at = CURRENT_TIMESTAMP 
-                        WHERE id = ?
-                    ''', (user_id, key_id))
-
-                    conn.commit()
+                if not user:
                     conn.close()
-
                     return {
                         'success': False,
                         'error': 'Сначала зарегистрируйтесь через /start'
                     }
 
-                # Помечаем ключ как использованный
+                # Проверяем, не активирован ли уже ключ у этого пользователя
+                cursor.execute(
+                    "SELECT activation_key_id FROM users WHERE user_id = ? AND activation_key_id IS NOT NULL",
+                    (user_id,)
+                )
+                existing_key = cursor.fetchone()
+
+                if existing_key:
+                    conn.close()
+                    return {
+                        'success': False,
+                        'error': 'У вас уже активирован ключ. Сначала отключите текущий.'
+                    }
+
+                # Устанавливаем даты подписки
+                start_date = datetime.now().date()
+                end_date = start_date + timedelta(days=duration_days)
+
+                # Обновляем пользователя
+                cursor.execute('''
+                    UPDATE users 
+                    SET subscription_plan_id = ?,
+                        activation_key_id = ?,
+                        requests_limit = ?,
+                        requests_used = 0,
+                        subscription_start = ?,
+                        subscription_end = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                ''', (plan_id, key_id, max_requests, start_date, end_date, user_id))
+
+                # Помечаем ключ как использованный и привязываем к пользователю
                 cursor.execute('''
                     UPDATE activation_keys 
-                    SET is_used = 1, used_by_user_id = ?, used_at = CURRENT_TIMESTAMP 
+                    SET is_used = 1, 
+                        used_by_user_id = ?, 
+                        used_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                 ''', (user_id, key_id))
 
@@ -321,13 +351,14 @@ class Database:
                     'max_requests': max_requests,
                     'start_date': start_date,
                     'end_date': end_date,
-                    'duration_days': duration_days
+                    'duration_days': duration_days,
+                    'key_id': key_id
                 }
 
         return await asyncio.to_thread(sync_activate)
 
     async def validate_key(self, key_code: str) -> Dict[str, Any]:
-        """Проверка ключа без активации"""
+        """Проверка ключа с информацией о использовании"""
 
         def sync_validate():
             with self._lock:
@@ -336,9 +367,11 @@ class Database:
 
                 cursor.execute('''
                     SELECT ak.*, sp.name as plan_name, sp.description, 
-                           sp.max_requests, sp.duration_days, sp.price
+                           sp.max_requests, sp.duration_days, sp.price,
+                           u.user_id as used_by_id, u.username, u.full_name
                     FROM activation_keys ak
                     JOIN subscription_plans sp ON ak.plan_id = sp.id
+                    LEFT JOIN users u ON ak.used_by_user_id = u.user_id
                     WHERE ak.key_code = ?
                 ''', (key_code,))
 
@@ -352,8 +385,18 @@ class Database:
 
                 # Проверяем статус ключа
                 if key_dict['is_used']:
+                    if key_dict['used_by_id']:
+                        used_by = f"пользователем {key_dict['full_name']} (@{key_dict['username'] or 'нет'})"
+                    else:
+                        used_by = "другим пользователем"
                     conn.close()
-                    return {'valid': False, 'error': 'Ключ уже использован'}
+                    return {
+                        'valid': False,
+                        'error': f'Ключ уже использован {used_by}',
+                        'used_by_user_id': key_dict['used_by_id'],
+                        'used_by_username': key_dict['username'],
+                        'used_by_full_name': key_dict['full_name']
+                    }
 
                 if key_dict['expires_at'] and datetime.fromisoformat(key_dict['expires_at']) < datetime.now():
                     conn.close()
@@ -368,10 +411,70 @@ class Database:
                     'duration_days': key_dict['duration_days'],
                     'price': key_dict['price'],
                     'created_at': key_dict['created_at'],
-                    'expires_at': key_dict['expires_at']
+                    'expires_at': key_dict['expires_at'],
+                    'is_used': key_dict['is_used']
                 }
 
         return await asyncio.to_thread(sync_validate)
+
+    async def deactivate_user_key(self, user_id: int) -> bool:
+        """Отвязка ключа от пользователя (перевод на FREE план)"""
+
+        def sync_deactivate():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                # Получаем текущий ключ пользователя
+                cursor.execute(
+                    "SELECT activation_key_id FROM users WHERE user_id = ?",
+                    (user_id,)
+                )
+                user_data = cursor.fetchone()
+
+                if not user_data or not user_data['activation_key_id']:
+                    conn.close()
+                    return False
+
+                key_id = user_data['activation_key_id']
+
+                # Получаем ID FREE плана
+                cursor.execute("SELECT id, max_requests FROM subscription_plans WHERE name = 'FREE'")
+                free_plan = cursor.fetchone()
+
+                if not free_plan:
+                    conn.close()
+                    return False
+
+                # Обновляем пользователя на FREE план
+                start_date = datetime.now().date()
+                end_date = start_date + timedelta(days=30)
+
+                cursor.execute('''
+                    UPDATE users 
+                    SET subscription_plan_id = ?,
+                        activation_key_id = NULL,
+                        requests_limit = ?,
+                        subscription_start = ?,
+                        subscription_end = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                ''', (free_plan['id'], free_plan['max_requests'], start_date, end_date, user_id))
+
+                # Ключ остается использованным и не может быть использован повторно
+
+                # Добавляем запись в историю подписок
+                cursor.execute('''
+                    INSERT INTO subscription_history 
+                    (user_id, plan_id, start_date, end_date) 
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, free_plan['id'], start_date, end_date))
+
+                conn.commit()
+                conn.close()
+                return True
+
+        return await asyncio.to_thread(sync_deactivate)
 
     async def get_user_active_key(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Получение активного ключа пользователя"""
@@ -436,62 +539,31 @@ class Database:
 
         return await asyncio.to_thread(sync_get_keys)
 
-    async def revoke_key(self, key_code: str) -> bool:
-        """Отзыв ключа (помечаем как неиспользованный)"""
+    async def is_key_linked_to_user(self, user_id: int, key_code: str) -> bool:
+        """Проверка, привязан ли ключ к пользователю"""
 
-        def sync_revoke():
+        def sync_check():
             with self._lock:
                 conn = self._get_connection()
                 cursor = conn.cursor()
 
-                # Находим ключ
-                cursor.execute(
-                    "SELECT id, used_by_user_id FROM activation_keys WHERE key_code = ?",
-                    (key_code,)
-                )
-                key_data = cursor.fetchone()
-
-                if not key_data:
-                    conn.close()
-                    return False
-
-                key_id = key_data['id']
-                user_id = key_data['used_by_user_id']
-
-                # Обновляем ключ
                 cursor.execute('''
-                    UPDATE activation_keys 
-                    SET is_used = 0, used_by_user_id = NULL, used_at = NULL 
-                    WHERE id = ?
-                ''', (key_id,))
+                    SELECT COUNT(*) as count 
+                    FROM activation_keys ak
+                    JOIN users u ON ak.id = u.activation_key_id
+                    WHERE ak.key_code = ? AND u.user_id = ?
+                ''', (key_code, user_id))
 
-                # Если ключ был привязан к пользователю, сбрасываем его подписку на FREE
-                if user_id:
-                    # Получаем ID FREE плана
-                    cursor.execute("SELECT id FROM subscription_plans WHERE name = 'FREE'")
-                    free_plan = cursor.fetchone()
-
-                    if free_plan:
-                        cursor.execute('''
-                            UPDATE users 
-                            SET subscription_plan_id = ?, 
-                                activation_key_id = NULL,
-                                requests_limit = (SELECT max_requests FROM subscription_plans WHERE id = ?),
-                                subscription_start = date('now'),
-                                subscription_end = date('now', '+30 days')
-                            WHERE user_id = ?
-                        ''', (free_plan['id'], free_plan['id'], user_id))
-
-                conn.commit()
+                result = cursor.fetchone()
                 conn.close()
-                return True
+                return result['count'] > 0 if result else False
 
-        return await asyncio.to_thread(sync_revoke)
+        return await asyncio.to_thread(sync_check)
 
-    # ==================== ОБНОВЛЕННЫЕ МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ====================
+    # ==================== МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ====================
 
     async def add_user(self, user_id: int, username: Optional[str], full_name: str) -> Dict[str, Any]:
-        """Добавление пользователя в БД (без ключа по умолчанию)"""
+        """Добавление пользователя в БД"""
 
         def sync_add():
             with self._lock:
@@ -584,9 +656,9 @@ class Database:
 
         return await asyncio.to_thread(sync_get)
 
-    # ==================== ОСТАЛЬНЫЕ МЕТОДЫ (оставляем без изменений) ====================
-
     async def get_all_users(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Получение всех пользователей"""
+
         def sync_get_all():
             with self._lock:
                 conn = self._get_connection()
@@ -605,6 +677,8 @@ class Database:
         return await asyncio.to_thread(sync_get_all)
 
     async def get_users_count(self) -> int:
+        """Получение количества пользователей"""
+
         def sync_get_count():
             with self._lock:
                 conn = self._get_connection()
@@ -617,6 +691,8 @@ class Database:
         return await asyncio.to_thread(sync_get_count)
 
     async def check_user_access(self, user_id: int) -> Dict[str, Any]:
+        """Проверка доступа пользователя"""
+
         def sync_check():
             with self._lock:
                 conn = self._get_connection()
@@ -657,6 +733,8 @@ class Database:
         return await asyncio.to_thread(sync_check)
 
     async def increment_user_requests(self, user_id: int) -> bool:
+        """Увеличение счетчика использованных запросов"""
+
         def sync_increment():
             with self._lock:
                 conn = self._get_connection()
@@ -671,24 +749,9 @@ class Database:
 
         return await asyncio.to_thread(sync_increment)
 
-    async def add_user_request(self, user_id: int, request_type: str,
-                               request_data: str, response_data: str,
-                               tokens_used: int = 0):
-        def sync_add_request():
-            with self._lock:
-                conn = self._get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO user_requests 
-                    (user_id, request_type, request_data, response_data, tokens_used) 
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (user_id, request_type, request_data, response_data, tokens_used))
-                conn.commit()
-                conn.close()
-
-        await asyncio.to_thread(sync_add_request)
-
     async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
+        """Получение статистики пользователя"""
+
         def sync_get_stats():
             with self._lock:
                 conn = self._get_connection()
@@ -717,6 +780,163 @@ class Database:
                 return result
 
         return await asyncio.to_thread(sync_get_stats)
+
+    async def get_all_subscription_plans(self) -> List[Dict[str, Any]]:
+        """Получение всех планов подписки"""
+
+        def sync_get_plans():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM subscription_plans WHERE is_active = 1 ORDER BY price ASC')
+                rows = cursor.fetchall()
+                conn.close()
+                return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(sync_get_plans)
+
+    # ==================== МЕТОДЫ ДЛЯ ССЫЛОК ====================
+
+    async def add_user_link(self, user_id: int, url: str, title: str = None,
+                            description: str = None, category: str = 'general') -> int:
+        """Добавление ссылки пользователя"""
+
+        def sync_add_link():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                cursor.execute('''
+                    INSERT INTO user_links 
+                    (user_id, url, title, description, category) 
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (user_id, url, title, description, category))
+
+                link_id = cursor.lastrowid
+                conn.commit()
+                conn.close()
+                return link_id
+
+        return await asyncio.to_thread(sync_add_link)
+
+    async def get_user_links(self, user_id: int, category: str = None,
+                             limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        """Получение ссылок пользователя"""
+
+        def sync_get_links():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                query = '''
+                    SELECT * FROM user_links 
+                    WHERE user_id = ? AND is_active = 1
+                '''
+                params = [user_id]
+
+                if category:
+                    query += " AND category = ?"
+                    params.append(category)
+
+                query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+                params.extend([limit, offset])
+
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                conn.close()
+                return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(sync_get_links)
+
+    async def get_user_link_count(self, user_id: int, category: str = None) -> int:
+        """Получение количества ссылок пользователя"""
+
+        def sync_get_count():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                query = "SELECT COUNT(*) as count FROM user_links WHERE user_id = ? AND is_active = 1"
+                params = [user_id]
+
+                if category:
+                    query += " AND category = ?"
+                    params.append(category)
+
+                cursor.execute(query, params)
+                result = cursor.fetchone()
+                conn.close()
+                return result['count'] if result else 0
+
+        return await asyncio.to_thread(sync_get_count)
+
+    async def get_link_categories(self, user_id: int) -> List[str]:
+        """Получение категорий ссылок пользователя"""
+
+        def sync_get_categories():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                cursor.execute('''
+                    SELECT DISTINCT category 
+                    FROM user_links 
+                    WHERE user_id = ? AND is_active = 1
+                    ORDER BY category
+                ''', (user_id,))
+
+                rows = cursor.fetchall()
+                conn.close()
+                return [row['category'] for row in rows]
+
+        return await asyncio.to_thread(sync_get_categories)
+
+    async def search_user_links(self, user_id: int, search_query: str,
+                                limit: int = 20) -> List[Dict[str, Any]]:
+        """Поиск ссылок пользователя"""
+
+        def sync_search_links():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                search_term = f"%{search_query}%"
+                cursor.execute('''
+                    SELECT * FROM user_links 
+                    WHERE user_id = ? AND is_active = 1 
+                    AND (url LIKE ? OR title LIKE ? OR description LIKE ? OR category LIKE ?)
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                ''', (user_id, search_term, search_term, search_term, search_term, limit))
+
+                rows = cursor.fetchall()
+                conn.close()
+                return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(sync_search_links)
+
+    async def delete_user_link(self, link_id: int, user_id: int = None) -> bool:
+        """Удаление ссылки пользователя"""
+
+        def sync_delete_link():
+            with self._lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+
+                query = "UPDATE user_links SET is_active = 0 WHERE id = ?"
+                params = [link_id]
+
+                if user_id:
+                    query += " AND user_id = ?"
+                    params.append(user_id)
+
+                cursor.execute(query, params)
+                conn.commit()
+                success = cursor.rowcount > 0
+                conn.close()
+                return success
+
+        return await asyncio.to_thread(sync_delete_link)
 
 
 # Синглтон для работы с БД

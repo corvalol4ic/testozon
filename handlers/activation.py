@@ -2,8 +2,10 @@ from aiogram import Router, types, F
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery
 from database.db import database
-from keyboards.inline import get_activation_keyboard, get_admin_keys_keyboard
+from keyboards.inline import get_activation_keyboard, get_admin_keys_keyboard, get_confirmation_keyboard
+from keyboards.reply import get_links_menu_keyboard
 
 router = Router()
 
@@ -17,8 +19,8 @@ async def cmd_activate(message: types.Message, state: FSMContext):
     """Команда для активации ключа"""
     await message.answer(
         "🔑 Введите ваш ключ активации:\n\n"
-        "Формат: XXXXX-XXXXX-XXXXX-XXXXX\n"
-        "Пример: A1B2C-D3E4F-G5H6I-J7K8L\n\n"
+        "Формат: XXXX-XXXX-XXXX-XXXX\n"
+        "Пример: ABCD-EFGH-IJKL-MNOP\n\n"
         "❌ Для отмены введите /cancel"
     )
     await state.set_state(ActivationStates.waiting_for_key)
@@ -35,7 +37,6 @@ async def process_activation_key(message: types.Message, state: FSMContext):
         await message.answer("❌ Активация отменена")
         return
 
-    # Проверяем формат ключа
     # Проверяем формат ключа (XXXX-XXXX-XXXX-XXXX)
     if len(key_code) != 19 or key_code.count('-') != 3:
         await message.answer(
@@ -45,6 +46,23 @@ async def process_activation_key(message: types.Message, state: FSMContext):
             "Попробуйте еще раз или введите /cancel для отмены"
         )
         return
+
+    # Проверяем, что каждая часть содержит только разрешенные символы
+    parts = key_code.split('-')
+    if len(parts) != 4:
+        await message.answer(
+            "❌ Неверный формат ключа! Должно быть 4 группы символов\n\n"
+            "Попробуйте еще раз или введите /cancel для отмены"
+        )
+        return
+
+    for part in parts:
+        if len(part) != 4:
+            await message.answer(
+                f"❌ Неверная длина группы '{part}'! Должно быть 4 символа\n\n"
+                "Попробуйте еще раз или введите /cancel для отмены"
+            )
+            return
 
     # Проверяем ключ
     validation = await database.validate_key(key_code)
@@ -67,8 +85,16 @@ async def process_activation_key(message: types.Message, state: FSMContext):
             f"📅 Начало подписки: {result['start_date']}\n"
             f"📅 Окончание: {result['end_date']}\n"
             f"⏳ Длительность: {result['duration_days']} дней\n\n"
-            f"🎉 Теперь у вас есть доступ к премиум функциям!",
+            f"🔒 Ключ привязан к вашему аккаунту и не может быть использован повторно.\n\n"
+            f"🎉 Теперь у вас есть доступ к премиум функциям!\n\n"
+            f"🔗 Для управления ссылками используйте /links",
             parse_mode="HTML"
+        )
+
+        # Показываем меню ссылок
+        await message.answer(
+            "📋 Выберите действие в меню ссылок:",
+            reply_markup=get_links_menu_keyboard()
         )
 
         # Показываем текущую статистику
@@ -105,7 +131,7 @@ async def cmd_my_key(message: types.Message):
         key_info = await database.validate_key(activation_key)
 
         if key_info['valid']:
-            key_status = "✅ Активен"
+            key_status = "✅ Активен и привязан к вашему аккаунту"
         else:
             key_status = f"❌ {key_info.get('error', 'Недействителен')}"
 
@@ -116,7 +142,9 @@ async def cmd_my_key(message: types.Message):
             f"📊 Лимит: {key_info.get('max_requests', 0)} запросов\n"
             f"📅 Создан: {key_info.get('created_at', 'N/A')[:10]}\n"
             f"📅 Истекает: {key_info.get('expires_at', 'N/A')[:10] if key_info.get('expires_at') else 'Бессрочно'}\n"
-            f"📊 Статус: {key_status}",
+            f"📊 Статус: {key_status}\n\n"
+            f"⚠️ Этот ключ привязан только к вашему аккаунту и "
+            f"не может быть использован повторно.",
             parse_mode="HTML"
         )
     else:
@@ -136,9 +164,105 @@ async def cmd_check_key(message: types.Message, state: FSMContext):
     await message.answer(
         "🔍 Введите ключ для проверки:\n\n"
         "Я проверю его валидность и покажу информацию о плане.\n\n"
+        "Формат: XXXX-XXXX-XXXX-XXXX\n\n"
         "❌ Для отмены введите /cancel"
     )
     await state.set_state(ActivationStates.waiting_for_key)
+
+
+@router.message(Command("deactivate"))
+async def cmd_deactivate(message: types.Message):
+    """Отвязка текущего ключа (переход на FREE план)"""
+    user = await database.get_user(user_id=message.from_user.id)
+
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+
+    if not user.get('activation_key_id'):
+        await message.answer("🔓 У вас нет активированного ключа.")
+        return
+
+    # Запрашиваем подтверждение
+    await message.answer(
+        "⚠️ Вы уверены, что хотите отвязать текущий ключ?\n\n"
+        "После отвязки:\n"
+        "• Вы перейдете на FREE план (50 запросов/мес)\n"
+        "• Текущий ключ будет отмечен как использованный\n"
+        "• Ключ нельзя будет использовать повторно\n\n"
+        "Для подтверждения отвязки нажмите кнопку ниже:",
+        reply_markup=get_confirmation_keyboard("deactivate_key")
+    )
+
+
+@router.message(Command("replace_key"))
+async def cmd_replace_key(message: types.Message):
+    """Замена текущего ключа на новый"""
+    user = await database.get_user(user_id=message.from_user.id)
+
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+
+    if not user.get('activation_key_id'):
+        await message.answer("🔓 У вас нет активированного ключа. Используйте /activate")
+        return
+
+    await message.answer(
+        "🔄 Замена ключа\n\n"
+        "Для замены ключа:\n"
+        "1. Сначала отвяжите текущий ключ командой /deactivate\n"
+        "2. Затем активируйте новый ключ командой /activate\n\n"
+        "⚠️ Внимание: текущий ключ будет отмечен как использованный "
+        "и не сможет быть активирован повторно."
+    )
+
+
+@router.message(Command("key_status"))
+async def cmd_key_status(message: types.Message):
+    """Статус ключа с подробной информацией"""
+    user = await database.get_user(user_id=message.from_user.id)
+
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+
+    activation_key = user.get('activation_key')
+
+    if activation_key:
+        # Получаем детальную информацию о ключе
+        key_info = await database.validate_key(activation_key)
+
+        if key_info['valid']:
+            status = "✅ Активен и привязан к вашему аккаунту"
+            key_details = (
+                f"🔑 Ключ: <code>{activation_key}</code>\n"
+                f"💎 План: {key_info['plan_name']}\n"
+                f"📊 Лимит: {key_info['max_requests']} запросов\n"
+                f"📅 Создан: {key_info.get('created_at', 'N/A')[:10]}\n"
+                f"📅 Истекает: {key_info.get('expires_at', 'N/A')[:10] if key_info.get('expires_at') else 'Бессрочно'}\n"
+                f"📊 Статус: {status}\n\n"
+                f"⚠️ Этот ключ привязан только к вашему аккаунту и "
+                f"не может быть использован повторно."
+            )
+        else:
+            key_details = (
+                f"🔑 Ключ: <code>{activation_key}</code>\n"
+                f"❌ Статус: {key_info['error']}\n\n"
+                f"ℹ️ {key_info.get('error', 'Ключ недействителен')}"
+            )
+    else:
+        key_details = (
+            "🔐 У вас нет активного ключа активации.\n\n"
+            "💎 Чтобы получить доступ к премиум функциям:\n"
+            "1. Купите подписку на нашем сайте\n"
+            "2. Получите ключ активации\n"
+            "3. Используйте команду /activate\n\n"
+            "⚠️ Каждый ключ можно активировать только один раз "
+            "и только на одном аккаунте."
+        )
+
+    await message.answer(key_details, parse_mode="HTML")
 
 
 @router.message(Command("keys_info"))
@@ -153,21 +277,23 @@ async def cmd_keys_info(message: types.Message):
     3. Активируете ключ в боте командой /activate
     4. Получаете доступ к премиум функциям
 
-    📋 Доступные планы:
-    • FREE - 50 запросов/мес (бесплатно)
-    • BASIC - 500 запросов/мес (10$)
-    • PRO - 2000 запросов/мес (25$)
-    • PREMIUM - 10000 запросов/мес (50$)
-    • ENTERPRISE - 50000 запросов/мес (200$)
+    🔒 Защита от повторного использования:
+    • Каждый ключ можно активировать только один раз
+    • Ключ привязывается к конкретному аккаунту Telegram
+    • После активации ключ нельзя использовать повторно
+    • Ключ нельзя передать другому пользователю
 
-    🔧 Команды:
+    🔧 Управление ключами:
     /activate - Активировать ключ
+    /deactivate - Отвязать текущий ключ
+    /key_status - Статус вашего ключа
     /my_key - Показать ваш ключ
     /check_key - Проверить ключ
-    /subscription - Информация о подписке
-    /plans - Подробнее о планах
 
-    💰 Для покупки подписки обратитесь к администратору
+    ⚠️ Важно:
+    • При отвязке ключа вы переходите на FREE план
+    • Отвязанный ключ остается использованным
+    • Новый ключ нужно покупать отдельно
     """
     await message.answer(info_text)
 
@@ -191,7 +317,6 @@ async def cmd_admin_keys(message: types.Message, command: CommandObject):
             "/admin_keys generate <план> [количество] - Сгенерировать ключи\n"
             "/admin_keys list <план> [used/all] - Список ключей\n"
             "/admin_keys check <ключ> - Проверить ключ\n"
-            "/admin_keys revoke <ключ> - Отозвать ключ\n"
             "/admin_keys stats - Статистика ключей\n"
             "/admin_keys user <user_id> - Ключ пользователя"
         )
@@ -244,7 +369,6 @@ async def cmd_admin_keys(message: types.Message, command: CommandObject):
                 used_filter = True
             elif filter_type == "new":
                 used_filter = False
-            # all = None (показываем все)
 
             keys = await database.get_all_keys(plan_name=plan_name, used=used_filter, limit=50)
 
@@ -254,7 +378,7 @@ async def cmd_admin_keys(message: types.Message, command: CommandObject):
 
             keys_text = f"🔑 Ключи плана {plan_name} ({filter_type}):\n\n"
 
-            for key in keys[:20]:  # Показываем первые 20
+            for key in keys[:20]:
                 status = "✅" if not key['is_used'] else "❌"
                 used_by = f"👤 {key.get('full_name', 'Unknown')}" if key['is_used'] else "🆕 Новый"
                 keys_text += f"{status} <code>{key['key_code']}</code> - {used_by}\n"
@@ -295,19 +419,6 @@ async def cmd_admin_keys(message: types.Message, command: CommandObject):
 
         except IndexError:
             await message.answer("❌ Используйте: /admin_keys check <ключ>")
-
-    elif args.startswith("revoke"):
-        try:
-            key_code = args.split(maxsplit=1)[1].upper()
-            success = await database.revoke_key(key_code)
-
-            if success:
-                await message.answer(f"✅ Ключ {key_code} успешно отозван!")
-            else:
-                await message.answer(f"❌ Не удалось отозвать ключ {key_code}")
-
-        except IndexError:
-            await message.answer("❌ Используйте: /admin_keys revoke <ключ>")
 
     elif args == "stats":
         keys = await database.get_all_keys(limit=1000)
@@ -365,17 +476,58 @@ async def cmd_admin_keys(message: types.Message, command: CommandObject):
             await message.answer("❌ Используйте: /admin_keys user <user_id>")
 
 
-# Обработка callback-кнопок
-@router.callback_query(F.data == "activate_key")
-async def callback_activate_key(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка нажатия на кнопку активации"""
-    await cmd_activate(callback.message, state)
+# Обработчики callback-кнопок
+@router.callback_query(F.data == "confirm_deactivate_key")
+async def callback_confirm_deactivate(callback: CallbackQuery):
+    """Подтверждение отвязки ключа"""
+    success = await database.deactivate_user_key(callback.from_user.id)
+
+    if success:
+        await callback.message.edit_text(
+            "✅ Ключ успешно отвязан!\n\n"
+            "📋 Вы переведены на FREE план (50 запросов/мес).\n"
+            "🔑 Старый ключ отмечен как использованный.\n\n"
+            "💎 Для активации нового ключа используйте /activate"
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Не удалось отвязать ключ.\n"
+            "Возможно, у вас нет активного ключа."
+        )
+
     await callback.answer()
 
 
-@router.callback_query(F.data == "my_subscription")
-async def callback_my_subscription(callback: types.CallbackQuery):
-    """Обработка нажатия на кнопку подписки"""
-    from handlers.start import cmd_subscription
-    await cmd_subscription(callback.message)
+@router.callback_query(F.data == "cancel_deactivate_key")
+async def callback_cancel_deactivate(callback: CallbackQuery):
+    """Отмена отвязки ключа"""
+    await callback.message.edit_text("❌ Отвязка ключа отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "deactivate_key")
+async def callback_deactivate_key(callback: CallbackQuery):
+    """Обработка нажатия на кнопку отвязки ключа"""
+    await cmd_deactivate(callback.message)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "replace_key")
+async def callback_replace_key(callback: CallbackQuery):
+    """Обработка нажатия на кнопку замены ключа"""
+    await cmd_replace_key(callback.message)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "key_status")
+async def callback_key_status(callback: CallbackQuery):
+    """Обработка нажатия на кнопку статуса ключа"""
+    await cmd_key_status(callback.message)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "activate_key")
+async def callback_activate_key(callback: CallbackQuery, state: FSMContext):
+    """Обработка нажатия на кнопку активации"""
+    await cmd_activate(callback.message, state)
     await callback.answer()
